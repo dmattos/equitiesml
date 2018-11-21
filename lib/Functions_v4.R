@@ -108,34 +108,64 @@ rawFactors = function(filepath,startRow=2,filing_dates){
 modFactors = function(stocks,yr_upside,yr_downside,short=c(TRUE,FALSE)){
   
   for(i in 1:length(stocks)){
-    #Momentum / mean reversion
-    stocks[[i]]$r.5 = returnOverPeriod(stocks[[i]]$PX_LAST,5)
-    stocks[[i]]$r.21 = returnOverPeriod(stocks[[i]]$PX_LAST,21)
-    stocks[[i]]$r.63 = returnOverPeriod(stocks[[i]]$PX_LAST,63)
-    stocks[[i]]$r.126 = returnOverPeriod(stocks[[i]]$PX_LAST,126)
-    stocks[[i]]$r.252 = returnOverPeriod(stocks[[i]]$PX_LAST,252)
+    #Momentum - RSI
+    stocks[[i]]$RSI = RSI(stocks[[i]]$PX_LAST,n=21,maType="SMA") # 1 month RSI
+    stocks[[i]]$RSI.Sig = -(pmax(stocks[[i]]$RSI-80,0)+pmin(stocks[[i]]$RSI-20,0))
     
-    #Market influence
-    stocks[[i]]$ind.r.5 = returnOverPeriod(stocks[[i]]$IBOV,5)
-    stocks[[i]]$ind.r.21 = returnOverPeriod(stocks[[i]]$IBOV,21)
-    stocks[[i]]$ind.r.63 = returnOverPeriod(stocks[[i]]$IBOV,63)
-    stocks[[i]]$ind.r.126 = returnOverPeriod(stocks[[i]]$IBOV,126)
-    stocks[[i]]$ind.r.252 = returnOverPeriod(stocks[[i]]$IBOV,252)
+    #Moving average
+    stocks[[i]]$SMA.21 = SMA(stocks[[i]]$PX_LAST,n=21) # 1 month SMA
+    stocks[[i]]$SMA.63 = SMA(stocks[[i]]$PX_LAST,n=63) # 3 month SMA
+    stocks[[i]]$SMA.Sig = c(diff(sign(stocks[[i]]$SMA.21-stocks[[i]]$SMA.63)),NA)
     
-    #Fundamentals
-    stocks[[i]]$ND.EBITDA = stocks[[i]]$NET_DEBT/stocks[[i]]$TRAIL_12M_EBITDA
-    stocks[[i]]$EV.EBITDA = (stocks[[i]]$CUR_MKT_CAP+stocks[[i]]$NET_DEBT+
-                               stocks[[i]]$MINORITY_INTEREST)/stocks[[i]]$TRAIL_12M_EBITDA
-    stocks[[i]]$P.E = stocks[[i]]$CUR_MKT_CAP/stocks[[i]]$TRAIL_12M_NET_INC
-    stocks[[i]]$P.BV = stocks[[i]]$PX_LAST/stocks[[i]]$BOOK_VAL_PER_SH
+    #Analyst consensus
+    stocks[[i]]$EQY_REC_CONS.Sig = c(diff(stocks[[i]]$EQY_REC_CONS),NA)
+    
+    #Fundamentals - EV/EBITDA
+    tryCatch(
+      {
+        stocks[[i]]$EV.EBITDA = (stocks[[i]]$CUR_MKT_CAP+stocks[[i]]$NET_DEBT+
+                                 stocks[[i]]$MINORITY_INTEREST)/stocks[[i]]$TRAIL_12M_EBITDA
+        stocks[[i]]$EV.EBITDA.Sig = -(stocks[[i]]$EV.EBITDA-SMA(stocks[[i]]$EV.EBITDA,n=500))
+      },
+      error=function(cond) {
+        message("EBITDA NA or insufficient data points\n")
+        message("Here's the original error message:")
+        message(cond)
+        # Choose a return value in case of error
+        return(NA)
+      }
+    )
+    
+    tryCatch(
+      {  
+        #Fundamentals - P/E
+        stocks[[i]]$P.E = stocks[[i]]$CUR_MKT_CAP/stocks[[i]]$TRAIL_12M_NET_INC
+        stocks[[i]]$P.E.Sig = -(stocks[[i]]$P.E-SMA(stocks[[i]]$P.E,n=500))
+        
+        #Fundamentals - Change in ROIC
+        stocks[[i]]$ROIC.Sig = stocks[[i]]$RETURN_ON_INV_CAPITAL-SMA(stocks[[i]]$RETURN_ON_INV_CAPITAL,n=500)
+      },
+      error=function(cond) {
+        message("Insufficient data points\n")
+        message("Here's the original error message:")
+        message(cond)
+        # Choose a return value in case of error
+        return(NA)
+      }
+    )
+    
     
     #One-month returns for stock
     stocks[[i]]$rf.21 = -returnOverPeriod(stocks[[i]]$PX_LAST,-21)
+    stocks[[i]]$rf.63 = -returnOverPeriod(stocks[[i]]$PX_LAST,-63)
     stocks[[i]]$r.1 = returnOverPeriod(stocks[[i]]$PX_LAST,1)
-    stocks[[i]]$pos = ifelse(stocks[[i]]$rf.21>yr_upside/12,1,
+    stocks[[i]]$pos.21 = ifelse(stocks[[i]]$rf.21>yr_upside/12,1,
                                  ifelse(stocks[[i]]$rf.21<(yr_downside/12),-1,0))
+    stocks[[i]]$pos.63 = ifelse(stocks[[i]]$rf.63>yr_upside/4,1,
+                                ifelse(stocks[[i]]$rf.21<(yr_downside/4),-1,0))
     if(short==FALSE){
-      stocks[[i]]$pos[stocks[[i]]$pos==-1]=0
+      stocks[[i]]$pos.21[stocks[[i]]$pos.21==-1]=0
+      stocks[[i]]$pos.63[stocks[[i]]$pos.63==-1]=0
     }
     
     #Remove columns that will not be used
@@ -161,61 +191,69 @@ walkForward = function(stock_A,train_len,test_len,starting_date){
   train=list()
   test=list()
   while(nrow(data)>(starting_index+train_len+i*(test_len))){
-    train[[i]] = data[(starting_index):(starting_index+train_len+(i-1)*test_len),]
+    train[[i]] = data[(starting_index+(i-1)*test_len):(starting_index+train_len+(i-1)*test_len),]
     test[[i]] = data[(starting_index+train_len+(i-1)*test_len+1):(starting_index+train_len+test_len*i),]
     i=i+1
   }
   test[[i]] = data[(nrow(data)-test_len):nrow(data),]
   train[[i]] = data[(nrow(data)-test_len-train_len):(nrow(data)-test_len-1),]
+  
+  # Random Forest
   for(i in 1:length(train)){
     # Train #
-    my_forest = randomForest(as.factor(pos) ~ 
-                               RETURN_ON_INV_CAPITAL+
-                               ROIC_WACC_RATIO+
-                               EPS_GROWTH+
-                               CASH_FLOW_GROWTH+
-                               r.5+
-                               r.21+
-                               r.63+
-                               r.126+
-                               r.252+
-                               ind.r.5+
-                               ind.r.21+
-                               ind.r.63+
-                               ind.r.126+
-                               ind.r.252+
-                               ND.EBITDA+
-                               EV.EBITDA+
-                               P.E+
-                               P.BV+
-                               EQY_REC_CONS,
+    my_forest = randomForest(as.factor(pos.63) ~ 
+                               RSI.Sig+
+                               SMA.Sig+
+                               EQY_REC_CONS.Sig+
+                               SALES_GROWTH+
+                               EBITDA_GROWTH+
+                               EV.EBITDA.Sig+
+                               P.E.Sig+
+                               ROIC.Sig,
                              data = train[[i]],
                              importance = TRUE,
-                             ntree = 500)
+                             ntree = 200)
+    
     # Test #
-    test[[i]]$rf.21 = NULL
-    true_pos = test[[i]]$pos
-    test[[i]]$pos = NULL
+    test[[i]]$rf.63 = NULL
     my_prediction = predict(my_forest,test[[i]])
+    print(table(my_prediction,test[[i]]$pos.63))
     position = xts(x=as.numeric(as.character(my_prediction)), order.by=as.Date(rownames(test[[i]])))
     colnames(position)="pos"
-    test[[i]]$pos = lag(position,1)
+    test[[i]]$pos.63 = lag(position,1)
     
   }
   walkFwd = do.call(rbind,test[-length(test)])
-  stockPerformance = xts(x=na.omit(walkFwd)[,c("PX_LAST","pos")],order.by=as.Date(rownames(na.omit(walkFwd))))
+  stockPerformance = xts(x=na.omit(walkFwd)[,c("PX_LAST","pos.63")],order.by=as.Date(rownames(na.omit(walkFwd))))
   stockPerformance$Ret = diff(log(stockPerformance$PX_LAST),na.rm=FALSE)
   stockPerformance = na.omit(stockPerformance)
-  stockPerformance$DailyPerf = stockPerformance$pos*stockPerformance$Ret
-  stockPerformance$StratPerf = cumsum(stockPerformance$DailyPerf)
-  stockPerformance$LongOnly = cumsum(stockPerformance$Ret)
-  StratPerf.MaxDD = maxdrawdown(stockPerformance$DailyPerf)
-  LongOnly.MaxDD = maxdrawdown(stockPerformance$Ret)
-  txt = sprintf("Strategy Maximum Pct. Drawdown: %.2f",StratPerf.MaxDD*100)
-  print(txt)
-  print(SharpeRatio(R=stockPerformance$DailyPerf,annualize = TRUE))
+  
+  # Long only strategy
+  stockPerformance$LongOnlyDaily = pmax(stockPerformance$pos.63,0)*stockPerformance$Ret
+  stockPerformance$LongOnly = cumsum(stockPerformance$LongOnlyDaily)
+  stockPerformance$BuyHold = cumsum(stockPerformance$Ret)
+  LongOnly.MaxDD = maxdrawdown(stockPerformance$LongOnlyDaily)
+  BuyHold.MaxDD = maxdrawdown(stockPerformance$Ret)
   txt = sprintf("Long Only Maximum Pct. Drawdown: %.2f",LongOnly.MaxDD*100)
   print(txt)
-  print(SharpeRatio(R=stockPerformance$Ret,annualize = TRUE))
-  autoplot(stockPerformance[,c("StratPerf","LongOnly")])
+  print(SharpeRatio(R=stockPerformance$LongOnlyDaily,FUN="StdDev",annualize = TRUE))
+  txt = sprintf("Buy and Hold Maximum Pct. Drawdown: %.2f",BuyHold.MaxDD*100)
+  print(txt)
+  print(SharpeRatio(R=stockPerformance$Ret,FUN="StdDev",annualize = TRUE))
+  autoplot(stockPerformance[,c("LongOnly","BuyHold")])
+  
+  # Long and short
+  stockPerformance$LongShortDaily = stockPerformance$pos*stockPerformance$Ret
+  stockPerformance$LongShort = cumsum(stockPerformance$LongShortDaily)
+  stockPerformance$BuyHold = cumsum(stockPerformance$Ret)
+  LongShort.MaxDD = maxdrawdown(stockPerformance$LongShortDaily)
+  BuyHold.MaxDD = maxdrawdown(stockPerformance$Ret)
+  txt = sprintf("Long Short Maximum Pct. Drawdown: %.2f",LongShort.MaxDD*100)
+  print(txt)
+  print(SharpeRatio(R=stockPerformance$LongShortDaily,FUN="StdDev",annualize = TRUE))
+  txt = sprintf("Buy and Hold Maximum Pct. Drawdown: %.2f",BuyHold.MaxDD*100)
+  print(txt)
+  print(SharpeRatio(R=stockPerformance$Ret,FUN="StdDev",annualize = TRUE))
+  autoplot(stockPerformance[,c("LongShort","BuyHold")])
 }
+
