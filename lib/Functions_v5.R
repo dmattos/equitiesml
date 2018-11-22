@@ -232,6 +232,17 @@ walkForward = function(stock_A,train_len,test_len,starting_date){
                              importance = TRUE,
                              ntree = 200)
     
+    my_reg = lm(rf.63 ~ 
+                  RSI.Sig+
+                  SMA.Sig+
+                  EQY_REC_CONS.Sig+
+                  SALES_GROWTH+
+                  EBITDA_GROWTH+
+                  EV.EBITDA.Sig+
+                  P.E.Sig+
+                  ROIC.Sig,
+                  data = train[[i]])
+    
     # Test #
     test[[i]]$rf.63 = NULL
     my_prediction = predict(my_forest,test[[i]])
