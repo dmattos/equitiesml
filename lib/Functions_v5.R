@@ -201,6 +201,29 @@ splitTrainTest = function(stock,train_len,test_len,starting_date){
   return(list(train,test))
 }
 
+# Model 1 - Regression
+testRegression = function(train,test){
+  # Train model
+  for(i in 1:length(train)){
+    linReg = lm(rf.63 ~ 
+                RSI.Sig+
+                SMA.Sig+
+                EQY_REC_CONS.Sig+
+                SALES_GROWTH+
+                EBITDA_GROWTH+
+                EV.EBITDA.Sig+
+                P.E.Sig+
+                ROIC.Sig,
+                data = train[[i]])
+  
+    # Test model
+    pred = predict(linReg,test[[i]])
+    pred = xts(x=as.numeric(pred), order.by=as.Date(rownames(test[[i]])))
+    colnames(pred)="Predicted Val"
+    pos = lag(pred,1)
+  }
+}
+
 # To be deprecated
 walkForward = function(stock_A,train_len,test_len,starting_date){
   data = na.omit(stock_A)
