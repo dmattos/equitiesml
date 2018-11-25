@@ -106,17 +106,28 @@ rawFactors = function(filepath,startRow=2,filing_dates){
 }
 
 # Add or adjust factors that will differ from pre-loaded ones from Bloomberg
-modFactors = function(stocks,yr_upside,yr_downside,short=c(TRUE,FALSE)){
+modFactors = function(stocks){
   
   for(i in 1:length(stocks)){
     #Momentum - RSI
     stocks[[i]]$RSI = RSI(stocks[[i]]$PX_LAST,n=21,maType="SMA") # 1 month RSI
     stocks[[i]]$RSI.Sig = -(pmax(stocks[[i]]$RSI-70,0)+pmin(stocks[[i]]$RSI-30,0))
     
+    #Momentum - Past returns for an equal period
+    stocks[[i]]$r.63 = returnOverPeriod(stocks[[i]]$PX_LAST,63)
+    
     #Moving average
-    stocks[[i]]$SMA.21 = SMA(stocks[[i]]$PX_LAST,n=21) # 1 month SMA
-    stocks[[i]]$SMA.63 = SMA(stocks[[i]]$PX_LAST,n=63) # 3 month SMA
-    stocks[[i]]$SMA.Sig = c(diff(sign(stocks[[i]]$SMA.21-stocks[[i]]$SMA.63)),NA)
+    tryCatch(
+      {
+        stocks[[i]]$SMA.63 = SMA(stocks[[i]]$PX_LAST,n=63) # 1 month SMA
+        stocks[[i]]$SMA.252 = SMA(stocks[[i]]$PX_LAST,n=252) # 3 month SMA
+        stocks[[i]]$SMA.Sig = c(diff(sign(stocks[[i]]$SMA.63-stocks[[i]]$SMA.252)),NA)
+      },
+      error=function(cond) {
+        print(paste(names(stocks)[i]," ",message(cond),"\n",sep=""))
+        return(NA)
+      }
+    )
     
     #Analyst consensus
     stocks[[i]]$EQY_REC_CONS.Sig = c(diff(stocks[[i]]$EQY_REC_CONS),NA)
@@ -156,17 +167,8 @@ modFactors = function(stocks,yr_upside,yr_downside,short=c(TRUE,FALSE)){
     # Three-month forward return for stock
     stocks[[i]]$rf.63 = -returnOverPeriod(stocks[[i]]$PX_LAST,-63)
     
-    # One day historical return
+    # One day returns
     stocks[[i]]$r.1 = returnOverPeriod(stocks[[i]]$PX_LAST,1)
-    
-    stocks[[i]]$pos.21 = ifelse(stocks[[i]]$rf.21>yr_upside/12,1,
-                                 ifelse(stocks[[i]]$rf.21<(yr_downside/12),-1,0))
-    stocks[[i]]$pos.63 = ifelse(stocks[[i]]$rf.63>yr_upside/4,1,
-                                ifelse(stocks[[i]]$rf.21<(yr_downside/4),-1,0))
-    if(short==FALSE){
-      stocks[[i]]$pos.21[stocks[[i]]$pos.21==-1]=0
-      stocks[[i]]$pos.63[stocks[[i]]$pos.63==-1]=0
-    }
     
     #Remove columns that will not be used
     stocks[[i]][,c("ANNOUNCEMENT_DT",
@@ -176,7 +178,9 @@ modFactors = function(stocks,yr_upside,yr_downside,short=c(TRUE,FALSE)){
                    "BOOK_VAL_PER_SH",
                    "OPERATING_ROIC",
                    "EQY_SH_OUT",
-                   "CUR_MKT_CAP")]=NULL
+                   "CUR_MKT_CAP",
+                   "ROIC_WACC_RATIO"
+                   )]=NULL
     
     #Remove full NA columns
     stocks[[i]] <- stocks[[i]][,colSums(is.na(stocks[[i]]))<nrow(stocks[[i]])]
@@ -201,11 +205,116 @@ splitTrainTest = function(stock,train_len,test_len,starting_date){
   return(list(train,test))
 }
 
+sig = function(pred,upper,lower){
+  res = ifelse(pred>upper,1,ifelse(pred<lower,-1,0))
+  return(res)
+}
+
+pos = function(sig){
+  pos = as.numeric(rep(0,length(sig)))
+  for(i in 2:length(sig)){
+    pos[i]=ifelse(pos[i-1]+sig[i-1]>1,1,ifelse(pos[i-1]+sig[i-1]<(-1),-1,pos[i-1]+sig[i-1]))
+  }
+  return(pos)
+}
+
 # Model 1 - Regression
-testRegression = function(train,test){
+testRegression = function(train,test,upper,lower){
   # Train model
-  for(i in 1:length(train)){
-    linReg = lm(rf.63 ~ 
+  linReg = lm(rf.63 ~ 
+              RSI.Sig+
+              SMA.Sig+
+              EQY_REC_CONS.Sig+
+              SALES_GROWTH+
+              EBITDA_GROWTH+
+              EV.EBITDA.Sig+
+              P.E.Sig+
+              ROIC.Sig+
+              r.63,
+              data = train[1:(nrow(train)-63),])
+  
+  # Summary of model
+  summary(linReg)
+  pred = predict(linReg,test)
+  signal = sig(pred=pred,upper,lower)
+  position=pos(signal)
+  ret_linreg=test[,"r.1"]*position
+  cum_ret_linreg=cumsum(ret_linreg)
+  cum_ret_buyhold=cumsum(test[,"r.1"])
+  result = xts(cbind(pred,signal,position,test[,"r.1"],
+                     ret_linreg,cum_ret_buyhold,cum_ret_linreg),
+               order.by=as.Date.character(rownames(test)))
+  colnames(result)=c("Predicted","Signal","Position","Daily_Ret",
+                     "Linreg_Ret","Cum_Ret_Buy_Hold","Cum_Ret_Linreg")
+  return(result)
+}
+
+testLasso = function(train,test,upper,lower){
+  # Train model
+  lambda <- 10^seq(5, -5, length = 100)
+  lasso.mod <- glmnet(as.matrix(train[1:(nrow(train)-63),c("RSI.Sig",
+                                                           "SMA.Sig",
+                                                           "EQY_REC_CONS.Sig",
+                                                           "SALES_GROWTH",
+                                                           "EBITDA_GROWTH",
+                                                           "EV.EBITDA.Sig",
+                                                           "P.E.Sig",
+                                                           "ROIC.Sig",
+                                                           "r.63")]),
+                      as.matrix(train[1:(nrow(train)-63),"rf.63"]),
+                      alpha = 1, lambda = lambda)
+  cv.out <- cv.glmnet(as.matrix(train[1:(nrow(train)-63),c("RSI.Sig",
+                                                           "SMA.Sig",
+                                                           "EQY_REC_CONS.Sig",
+                                                           "SALES_GROWTH",
+                                                           "EBITDA_GROWTH",
+                                                           "EV.EBITDA.Sig",
+                                                           "P.E.Sig",
+                                                           "ROIC.Sig",
+                                                           "r.63")]),
+                      as.matrix(train[1:(nrow(train)-63),"rf.63"]), 
+                      alpha = 1, nfolds = 10)
+  bestlam <- cv.out$lambda.min
+  lasso <- glmnet(as.matrix(train[1:(nrow(train)-63),c("RSI.Sig",
+                                                       "SMA.Sig",
+                                                       "EQY_REC_CONS.Sig",
+                                                       "SALES_GROWTH",
+                                                       "EBITDA_GROWTH",
+                                                       "EV.EBITDA.Sig",
+                                                       "P.E.Sig",
+                                                       "ROIC.Sig",
+                                                       "r.63")]),
+                  as.matrix(train[1:(nrow(train)-63),"rf.63"]), 
+                  alpha = 1, lambda = bestlam)
+  
+  # Summary of model
+  summary(lasso)
+  pred = predict(lasso,as.matrix(test[,c("RSI.Sig",
+                                         "SMA.Sig",
+                                         "EQY_REC_CONS.Sig",
+                                         "SALES_GROWTH",
+                                         "EBITDA_GROWTH",
+                                         "EV.EBITDA.Sig",
+                                         "P.E.Sig",
+                                         "ROIC.Sig",
+                                         "r.63")]))
+  signal = sig(pred=pred,upper,lower)
+  position=pos(signal)
+  ret_lasso=test[,"r.1"]*position
+  cum_ret_lasso=cumsum(ret_lasso)
+  cum_ret_buyhold=cumsum(test[,"r.1"])
+  result = xts(cbind(pred,signal,position,test[,"r.1"],
+                     ret_lasso,cum_ret_buyhold,cum_ret_lasso),
+               order.by=as.Date.character(rownames(test)))
+  colnames(result)=c("Predicted","Signal","Position","Daily_Ret",
+                     "Lasso_Ret","Cum_Ret_Buy_Hold","Cum_Ret_Lasso")
+  return(result)
+}
+
+# Model 3 - Random Forest
+testRandomForest = function(train,test,upper,lower){
+  # Train model
+  rfReg = randomForest(rf.63 ~ 
                 RSI.Sig+
                 SMA.Sig+
                 EQY_REC_CONS.Sig+
@@ -213,15 +322,64 @@ testRegression = function(train,test){
                 EBITDA_GROWTH+
                 EV.EBITDA.Sig+
                 P.E.Sig+
-                ROIC.Sig,
-                data = train[[i]])
+                ROIC.Sig+
+                r.63,
+              data = train[1:(nrow(train)-63),],
+              ntree=200)
   
-    # Test model
-    pred = predict(linReg,test[[i]])
-    pred = xts(x=as.numeric(pred), order.by=as.Date(rownames(test[[i]])))
-    colnames(pred)="Predicted Val"
-    pos = lag(pred,1)
-  }
+  # Summary of model
+  summary(rfReg)
+  pred = predict(rfReg,test)
+  signal = sig(pred=pred,upper,lower)
+  position=pos(signal)
+  ret_rf=test[,"r.1"]*position
+  cum_ret_rf=cumsum(ret_rf)
+  cum_ret_buyhold=cumsum(test[,"r.1"])
+  result = xts(cbind(pred,signal,position,test[,"r.1"],
+                     ret_rf,cum_ret_buyhold,cum_ret_rf),
+               order.by=as.Date.character(rownames(test)))
+  colnames(result)=c("Predicted","Signal","Position","Daily_Ret",
+                     "Rf_Ret","Cum_Ret_Buy_Hold","Cum_Ret_Rf")
+  return(result)
+}
+
+# Model 4 - XGBoost
+testXGBoost = function(train,test,upper,lower){
+  data= Matrix(as.matrix(train[,c("RSI.Sig",
+                                  "SMA.Sig",
+                                  "EQY_REC_CONS.Sig",
+                                  "SALES_GROWTH",
+                                  "EBITDA_GROWTH",
+                                  "EV.EBITDA.Sig",
+                                  "P.E.Sig",
+                                  "ROIC.Sig",
+                                  "r.63")]),sparse = TRUE)
+  label = train[,"rf.63"]
+  # Train model
+  xgbReg = xgboost(data = data, label = label, nthread = 2, nrounds = 2)
+  
+  # Summary of model
+  summary(xgbReg)
+  pred = predict(xgbReg,Matrix(as.matrix(test[,c("RSI.Sig",
+                                                "SMA.Sig",
+                                                "EQY_REC_CONS.Sig",
+                                                "SALES_GROWTH",
+                                                "EBITDA_GROWTH",
+                                                "EV.EBITDA.Sig",
+                                                "P.E.Sig",
+                                                "ROIC.Sig",
+                                                "r.63")]),sparse = TRUE))
+  signal = sig(pred=pred,upper,lower)
+  position=pos(signal)
+  ret_xgb=test[,"r.1"]*position
+  cum_ret_xgb=cumsum(ret_xgb)
+  cum_ret_buyhold=cumsum(test[,"r.1"])
+  result = xts(cbind(pred,signal,position,test[,"r.1"],
+                     ret_xgb,cum_ret_buyhold,cum_ret_xgb),
+               order.by=as.Date.character(rownames(test)))
+  colnames(result)=c("Predicted","Signal","Position","Daily_Ret",
+                     "Xgb_Ret","Cum_Ret_Buy_Hold","Cum_Ret_Xgb")
+  return(result)
 }
 
 # To be deprecated
